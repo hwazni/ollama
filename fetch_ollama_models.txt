@@ -1,0 +1,62 @@
+#!/bin/bash
+# fetch_ollama_models.sh
+# This script fetches models from the Ollama server every 1 seconds,
+# displays the models with an index, compares models to unload if needed,
+# and prints memory details.
+
+# Define the IP addresses of your servers (adjust as needed)
+SERVERS=("127.0.0.1")
+
+# Function to unload a model given its IP and model name.
+unload_model() {
+    local ip="$1"
+    local model="$2"
+    echo "Automatically unloading model '$model' on IP $ip..."
+    curl -s "http://$ip:11434/api/generate" -d "{\"model\": \"$model\", \"keep_alive\": 0}" > /dev/null
+}
+
+while true; do
+    echo "-----------------------------"
+    echo "Fetching models at $(date):"
+    for ip in "${SERVERS[@]}"; do
+        echo "Server: $ip"
+        # Fetch the JSON data from the server.
+        json=$(curl -s "http://$ip:11434/api/ps")
+        
+        # List models with an index.
+        echo "$json" | jq -r '.models | to_entries[] | "\(.key + 1)) \(.value.model)"'
+        
+        # Get the number of models, and if empty, default to 0.
+        model_count=$(echo "$json" | jq '.models | length' 2>/dev/null)
+        if [ -z "$model_count" ]; then
+            model_count=0
+        fi
+
+        # If there are at least two models, compare the first two.
+        if [ "$model_count" -ge 2 ]; then
+            # Assuming the newest model is at index 0 and the older one at index 1.
+            new_model=$(echo "$json" | jq -r '.models[0].model')
+            old_model=$(echo "$json" | jq -r '.models[1].model')
+            echo "Comparing models: New model: '$new_model' | Old model: '$old_model'"
+            if [ "$new_model" != "$old_model" ]; then
+                echo "New model differs from old model. Unloading the old model..."
+                unload_model "$ip" "$old_model"
+            else
+                echo "Models are identical; no unloading needed."
+            fi
+        fi
+        echo ""
+    done
+
+    echo "Memory details:"
+    if command -v free >/dev/null 2>&1; then
+        free -h
+    elif [ -f /proc/meminfo ]; then
+        echo "Using /proc/meminfo:"
+        grep -E 'MemTotal|MemFree|Buffers|Cached' /proc/meminfo
+    else
+        echo "Memory details not available on this system."
+    fi
+    echo ""
+    sleep 1
+done
