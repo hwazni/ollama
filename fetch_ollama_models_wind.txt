@@ -1,0 +1,79 @@
+# fetch_ollama_models.ps1
+# This script fetches models from the Ollama server every 5 seconds,
+# displays the models with an index, compares models to unload the older one if needed,
+# and prints memory details on Windows.
+
+# Define the IP addresses of your servers.
+$servers = @("127.0.0.1")
+
+function Unload-Model {
+    param (
+        [string]$ip,
+        [string]$model
+    )
+    Write-Host "Automatically unloading model '$model' on IP $ip..."
+    $url = "http://$ip:11434/api/generate"
+    $body = @{ model = $model; keep_alive = 0 } | ConvertTo-Json
+    try {
+        $result = Invoke-RestMethod -Uri $url -Method Post -ContentType "application/json" -Body $body
+    }
+    catch {
+        Write-Host "Error unloading model '$model' on IP $ip: $_"
+    }
+}
+
+while ($true) {
+    Write-Host "-----------------------------"
+    Write-Host "Fetching models at $(Get-Date):"
+    foreach ($ip in $servers) {
+        Write-Host "Server: $ip"
+        $url = "http://$ip:11434/api/ps"
+        try {
+            $json = Invoke-RestMethod -Uri $url -Method Get
+            # Assume the JSON has a property 'models' which is an array.
+            $models = $json.models
+            if ($null -eq $models) {
+                Write-Host "No models found."
+            }
+            else {
+                for ($i = 0; $i -lt $models.Count; $i++) {
+                    $index = $i + 1
+                    Write-Host "$index) $($models[$i].model)"
+                }
+                # If there are at least two models, compare the first two.
+                if ($models.Count -ge 2) {
+                    $newModel = $models[0].model
+                    $oldModel = $models[1].model
+                    Write-Host "Comparing models: New model: '$newModel' | Old model: '$oldModel'"
+                    if ($newModel -ne $oldModel) {
+                        Write-Host "New model differs from old model. Unloading the old model..."
+                        Unload-Model -ip $ip -model $oldModel
+                    }
+                    else {
+                        Write-Host "Models are identical; no unloading needed."
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Host "Error fetching models from $ip: $_"
+        }
+        Write-Host ""
+    }
+    
+    Write-Host "Memory details:"
+    try {
+        # Get memory details using CIM (in kilobytes).
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem
+        # Convert from KB to GB (1GB = 1048576 KB) and round to 2 decimal places.
+        $totalMemory = [math]::Round($os.TotalVisibleMemorySize / 1048576, 2)
+        $freeMemory = [math]::Round($os.FreePhysicalMemory / 1048576, 2)
+        Write-Host "Total Memory (GB): $totalMemory"
+        Write-Host "Free Memory (GB):  $freeMemory"
+    }
+    catch {
+        Write-Host "Error fetching memory details: $_"
+    }
+    Write-Host ""
+    Start-Sleep -Seconds 1
+}
