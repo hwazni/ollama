@@ -7,9 +7,9 @@ from openai import OpenAI
 Image‑chat Streamlit demo for **vLLM** (OpenAI‑compatible) servers.
 Compatible with the **OpenAI Python ≥ 1.0** client.
 
-• Upload an image once and the model will keep it in context for the rest of
-  the conversation, so you can **continue chatting like a normal chatbot**.
-• A new image automatically resets context (or use the Reset button).
+• Upload an image **once**. The app sends it exactly once; afterwards you can
+  chat freely while the model remembers the picture.
+• When you upload a **different** image or hit **Reset Chat**, context resets.
 
 ```bash
 pip install vllm[pillow] streamlit openai>=1
@@ -49,7 +49,7 @@ with st.sidebar:
         st.error("Enter your vLLM server URL (e.g. http://localhost:8000/v1)")
         st.stop()
 
-    # Create a dedicated OpenAI client instance (>=1.0 style)
+    # OpenAI client (>=1.0)
     client = OpenAI(
         api_key=api_key or "EMPTY",  # vLLM ignores it, client requires non‑empty
         base_url=server_url.rstrip("/"),
@@ -57,24 +57,22 @@ with st.sidebar:
 
     st.markdown(
         "If the app fails to connect, ensure that your vLLM server was started "
-        "with the **--serve-chat-completions** flag and that **image input** is "
-        "enabled for your chosen model.")
+        "with `--serve-chat-completions` and that **image input** is enabled.")
 
 # ─────────────────────── Utility: image ➜ data URL ───────────────────────
 
-def image_to_data_url(uploaded_file):
-    """Convert a Streamlit‑uploaded file into a base64 data URL."""
-    mime_type = uploaded_file.type
-    encoded = base64.b64encode(uploaded_file.getvalue()).decode()
+def image_to_data_url(file):
+    mime_type = file.type
+    encoded = base64.b64encode(file.getvalue()).decode()
     return f"data:{mime_type};base64,{encoded}"
 
 # ──────────────────────── Session‑state bootstrapping ────────────────────────
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # chat history for OpenAI format
+    st.session_state.messages = []          # Chat history
 if "image_data_url" not in st.session_state:
-    st.session_state.image_data_url = None
+    st.session_state.image_data_url = None  # Current image (base64 URL)
 if "image_sent" not in st.session_state:
-    st.session_state.image_sent = False  # has initial image been sent to model?
+    st.session_state.image_sent = False     # Has current image been sent?
 
 # ────────────────────────────── Main UI ──────────────────────────────
 uploaded_file = st.file_uploader(
@@ -82,10 +80,14 @@ uploaded_file = st.file_uploader(
     type=["png", "jpg", "jpeg", "webp"],
 )
 
+# Handle new uploads ONLY when the selected file changes --------------
 if uploaded_file:
+    new_data_url = image_to_data_url(uploaded_file)
+    if new_data_url != st.session_state.image_data_url:  # New or changed file
+        st.session_state.image_data_url = new_data_url
+        st.session_state.image_sent = False              # Force re‑send once
+        st.session_state.messages.clear()                # Fresh context
     st.image(uploaded_file, use_column_width=True)
-    st.session_state.image_data_url = image_to_data_url(uploaded_file)
-    st.session_state.image_sent = False  # new image resets context flag
 
 if st.sidebar.button("🔄 Reset Chat"):
     st.session_state.messages.clear()
@@ -95,10 +97,9 @@ if st.sidebar.button("🔄 Reset Chat"):
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if msg["role"] == "user":
-            # Extract the textual part from possible multimodal payload
             if isinstance(msg["content"], list):
-                text_snippets = [c.get("text", "") for c in msg["content"] if c["type"] == "text"]
-                st.markdown(text_snippets[0] if text_snippets else "")
+                text_parts = [c.get("text", "") for c in msg["content"] if c["type"] == "text"]
+                st.markdown(text_parts[0] if text_parts else "")
             else:
                 st.markdown(msg["content"])
         else:
@@ -108,12 +109,11 @@ for msg in st.session_state.messages:
 user_prompt = st.chat_input("Ask something… (image optional after first)")
 
 if user_prompt:
-    # Require an image only if starting a brand‑new conversation
     if not st.session_state.image_data_url and not st.session_state.messages:
         st.warning("Please upload an image first.")
         st.stop()
 
-    # Build user message: include image only once at the beginning
+    # Include image exactly once (first turn after upload) ---------------
     if not st.session_state.image_sent and st.session_state.image_data_url:
         user_msg_content = [
             {"type": "image_url", "image_url": {"url": st.session_state.image_data_url}},
