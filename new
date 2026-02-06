@@ -1,0 +1,178 @@
+import torch
+import torch.nn.functional as F
+
+# ============================================================
+# Helper 1: get itos list from old/new torchtext vocab
+# ============================================================
+def get_itos(vocab):
+    if hasattr(vocab, "get_itos"):
+        return vocab.get_itos()
+    return vocab.itos  # old torchtext
+
+# ============================================================
+# Helper 2: precompute teacher token sequences for each student word
+#   teacher_seq[sid] = tuple(teacher_token_ids) for " " + word
+# ============================================================
+def build_teacher_sequences_for_student_vocab(vocab, teacher_tokenizer, word_boundary=True):
+    itos = get_itos(vocab)
+    teacher_seq = []
+    for w in itos:
+        text = (" " + w) if word_boundary else w
+        ids = teacher_tokenizer.encode(text, add_special_tokens=False)
+        teacher_seq.append(tuple(int(i) for i in ids))
+    return teacher_seq  # list of tuples, length = V_student
+
+# ============================================================
+# Helper 3: EXACT log P_teacher(seq | context) using past_key_values
+#   seq is a tuple/list of teacher token ids for ONE student word
+# ============================================================
+@torch.no_grad()
+def teacher_logprob_of_seq_given_context(
+    teacher_model,
+    teacher_tokenizer,
+    context_text,
+    seq,
+    device
+):
+    """
+    Returns log P_teacher(seq | context_text) exactly:
+      sum_k log P(t_k | context, t_<k)
+    """
+    # Run teacher on context once
+    enc = teacher_tokenizer(context_text, return_tensors="pt", add_special_tokens=False)
+    enc = {k: v.to(device) for k, v in enc.items()}
+
+    out = teacher_model(**enc, use_cache=True)
+    past = out.past_key_values
+
+    logp_total = 0.0
+
+    # Score seq token-by-token
+    for tid in seq:
+        # logits at last position predict the next token
+        logits_next = out.logits[:, -1, :]            # [1, V_teacher]
+        logp_next = F.log_softmax(logits_next, dim=-1)[0, tid]
+        logp_total += float(logp_next.item())
+
+        # advance one token with cache
+        inp = torch.tensor([[tid]], device=device)
+        out = teacher_model(input_ids=inp, past_key_values=past, use_cache=True)
+        past = out.past_key_values
+
+    return logp_total
+
+# ============================================================
+# Main: KL + CE for ONE sentence (clear + simple, but heavy)
+# ============================================================
+def kd_loss_one_sentence(
+    x_text,
+    student_model,
+    teacher_model,
+    teacher_tokenizer,
+    student_tokenizer,
+    vocab,
+    teacher_seq,          # precomputed list of teacher sequences for each student id
+    alpha=0.5,
+    T=2.0,
+    device=None,
+):
+    """
+    Computes:
+      CE: student next-token prediction loss on the sentence
+      KL: between student distribution and teacher distribution projected onto student vocab
+          where teacher prob for each student word is computed EXACTLY via sequence probability.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    student_model.to(device).train()
+    teacher_model.to(device).eval()
+
+    # ----------------------------
+    # 1) Student tokenize (word-level) + shift
+    # ----------------------------
+    s_words = student_tokenizer(x_text)
+    if len(s_words) < 2:
+        raise ValueError("Sentence too short after tokenization.")
+
+    s_ids = torch.tensor(vocab.lookup_indices(s_words), dtype=torch.long, device=device)  # [L]
+    s_input  = s_ids[:-1].unsqueeze(0)   # [1, L-1]
+    s_labels = s_ids[1:].unsqueeze(0)    # [1, L-1]
+
+    # Student forward
+    s_out = student_model(s_input)
+    s_logits = s_out.logits              # [1, L-1, V_student]
+    V_student = s_logits.size(-1)
+
+    # CE over all positions
+    ce = F.cross_entropy(
+        s_logits.view(-1, V_student),
+        s_labels.view(-1),
+        ignore_index=-100
+    )
+
+    # ----------------------------
+    # 2) KL: for each position t, compute teacher distribution over ALL student words
+    #       using exact sequence log-probs, then KL with student distribution at t.
+    # ----------------------------
+    kl_sum = 0.0
+    Lm1 = s_logits.size(1)
+
+    for t in range(Lm1):
+        # context is words up to position t (predicting next word at t)
+        context_text = " ".join(s_words[: t + 1])
+
+        # Compute teacher log-prob for each student word (size 9949)
+        teacher_logps = torch.empty((V_student,), device=device)
+
+        for sid in range(V_student):
+            seq = teacher_seq[sid]
+            # if a vocab item has empty seq (rare), give it -inf
+            if seq is None or len(seq) == 0:
+                teacher_logps[sid] = -1e9
+            else:
+                teacher_logps[sid] = teacher_logprob_of_seq_given_context(
+                    teacher_model, teacher_tokenizer, context_text, seq, device
+                )
+
+        # teacher distribution over student vocab (normalize)
+        teacher_probs = torch.softmax(teacher_logps / T, dim=-1)        # [V_student]
+        # student distribution at this position
+        student_logp  = F.log_softmax(s_logits[0, t] / T, dim=-1)        # [V_student]
+
+        kl_t = F.kl_div(student_logp, teacher_probs, reduction="batchmean") * (T * T)
+        kl_sum = kl_sum + kl_t
+
+    kl = kl_sum / Lm1
+
+    # total KD loss
+    loss = alpha * kl + (1 - alpha) * ce
+    return loss, kl.detach(), ce.detach()
+
+# ============================================================
+# Example usage
+# ============================================================
+"""
+# Precompute once:
+teacher_seq = build_teacher_sequences_for_student_vocab(vocab, teacher_tokenizer, word_boundary=True)
+
+# Then per sentence/batch:
+x = "this is a remarkable event"
+loss, kl, ce = kd_loss_one_sentence(
+    x_text=x,
+    student_model=student_model,
+    teacher_model=teacher_model,
+    teacher_tokenizer=teacher_tokenizer,
+    student_tokenizer=student_tokenizer,
+    vocab=vocab,
+    teacher_seq=teacher_seq,
+    alpha=0.5,
+    T=2.0,
+)
+
+loss.backward()
+optimizer.step()
+optimizer.zero_grad()
+
+print("loss:", float(loss.item()), "kl:", float(kl.item()), "ce:", float(ce.item()))
+"""
