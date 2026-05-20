@@ -1,36 +1,34 @@
-import random
+import math
 import os
+import random
 import re
 import time
-import math
-from tqdm import tqdm
-from typing import Any, Tuple, Callable
 from pathlib import Path
+from typing import Any, Callable, Tuple
+
 import numpy as np
-import torch.nn.functional as F
 import torch
-from torch.types import Device
+import torch.nn.functional as F
 import torchtext
-torchtext.disable_torchtext_deprecation_warning()
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from quixer_model import Quixer
 from datasets import load_dataset
-from torchtext.vocab import build_vocab_from_iterator
+from torch.types import Device
 from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from quixer.quixer_model import Quixer
+
 
 def epoch_time(start_time: float, end_time: float) -> Tuple[float, float]:
     """
-    Computes time elapsed in minutes and seconds when given two UNIX timestamps
-    with the starting time and ending time.
-
-    Args:
-      start_time: Starting time as a UNIX timestamp.
-      end_time: End time as a UNIX timestamp.
+    Computes time elapsed in minutes and seconds.
     """
     elapsed_time = end_time - start_time
     elapsed_mins = int(elapsed_time / 60)
     elapsed_secs = int(elapsed_time - (elapsed_mins * 60))
     return elapsed_mins, elapsed_secs
+
 
 def batchify_s2s(
     data: torch.Tensor,
@@ -40,43 +38,20 @@ def batchify_s2s(
     device: Device,
 ) -> torch.Tensor:
     """
-    Takes in a sequence of token IDs as a torch tensor `data` and returns a torch tensor containing
-    the training data with shape `[number of batches + window_size, batch_size]`.
-
-    Each batch is represented by `window_size` contiguous rows in the returned tensor and
-    can be extracted using the `get_batch_s2s` function.
-
-    A sequence of pad tokens of length `window_size-1` is prepended to the data so as to
-    provide a context window for the first token.
-
-    Args:
-      data: A 1D torch tensor containing a sequence of token IDs.
-      batch_size: The number of sequences each batch should have.
-      window_size: How many tokens are considered in each context window (each of which is a sequence in the batch).
-      pad_token_id: The ID of the pad token, as supplied by the tokenizer.
-      device: Torch device the returned tensor is to be created on.
-
-    Returns:
-      Tensor containing data for each batch prepared for a next token prediction language
-      modelling task.
+    Takes a flat token-ID tensor and prepares fixed-window next-token batches.
     """
     batch_nr_of_elements = batch_size * window_size
     nr_of_batches = (data.size(0) - 1) // batch_nr_of_elements
 
-    # Discard tokens at the end of the data that do not fill a whole batch
     batched_data = (
         data[: nr_of_batches * batch_nr_of_elements]
         .view(batch_nr_of_elements, nr_of_batches)
         .T
     )
 
-    # Data for the first batch
     window_data = torch.cat(
         (
-            # Adds a sequence of pad tokens of length `window_size-1`
-            # to provide a context window for the first token.
             torch.full((window_size, 1), pad_token_id, device=device),
-            # Context for the first row of tokens in `batched_data`
             batched_data[-window_size:, :-1],
         ),
         dim=1,
@@ -84,34 +59,33 @@ def batchify_s2s(
 
     return torch.cat((window_data, batched_data))
 
+
 def batchify_s2s_text(
-    tokens: list,
+    tokens: list[str],
     batch_size: int,
     window_size: int,
 ) -> np.ndarray:
+    """
+    Same layout as batchify_s2s, but keeps token strings for teacher prompts.
+    """
     batch_nr_of_elements = batch_size * window_size
     nr_of_batches = (len(tokens) - 1) // batch_nr_of_elements
 
     flat = np.array(tokens[: nr_of_batches * batch_nr_of_elements], dtype=object)
     batched = flat.reshape(batch_nr_of_elements, nr_of_batches).T
 
-    pad_block = np.full((window_size, 1), "", dtype=object)
+    pad_block = np.full((window_size, 1), "<pad>", dtype=object)
     window_block = np.concatenate((pad_block, batched[-window_size:, :-1]), axis=1)
     return np.concatenate((window_block, batched))
 
 
 def get_batch_s2s(
-    source: torch.Tensor, i: int, window_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+    source: torch.Tensor | np.ndarray,
+    i: int,
+    window_size: int,
+) -> tuple[torch.Tensor | np.ndarray, torch.Tensor | np.ndarray]:
     """
-    Returns the `i`th batch; expects one of the tensors returned by `setup_dataset`.
-
-    Args:
-      source: Tensor containing data.
-      i: Index of the batch.
-      window_size: Context window size.
-    Returns:
-      The `i`th batch.
+    Returns the `i`th fixed-window batch.
     """
     return source[i : i + window_size].T, source[i + window_size]
 
@@ -126,113 +100,123 @@ def initialise_weights(model: torch.nn.Module) -> None:
             torch.nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
-        elif isinstance(m, torch.nn.Embedding):
+        if isinstance(m, torch.nn.Embedding):
             torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     model.apply(_init_weights)
 
 
 def setup_dataset(
-    device: Device, batch_size: int, window_size: int
-) -> Tuple[torchtext.vocab.Vocab, Tuple[torch.Tensor, torch.Tensor, torch.Tensor], np.ndarray, int]:
+    device: Device,
+    batch_size: int,
+    window_size: int,
+) -> Tuple[
+    torchtext.vocab.Vocab,
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    np.ndarray,
+    int,
+]:
     """
-    Downloads and tokenizes the Penn TreeBank dataset, and then sets it up for a
-    next-word prediction task.
+    Downloads Penn TreeBank and prepares Quixer next-word batches.
 
-    Args:
-      device: Device to store dataset on.
-      batch_size: Size of the batches.
-      window_size: Size of the context window.
-
-    Returns:
-      Vocabulary represented by a torchtext.vocab.Vocab instance along with
-      three torch tensors containing the training, validation and test data.
+    Returns the normal tensor batches plus a matching train_text_iter used only
+    for teacher prompt reconstruction during distillation.
     """
-
-    # Download dataset from the Hugging Face Hub / load dataset
-    raw_dset = load_dataset("ptb_text_only", trust_remote_code=True)
-
-    # DATASET_PATH = r"/home/ccib_dcda/data/Hadi-Main/Distilled-Quixer/ptb-dataset"
-    # data_files = {"train": "ptb.train.txt", "test": "ptb.test.txt", "validation": "ptb.valid.txt"}
-    # raw_dset = load_dataset(DATASET_PATH, data_files=data_files)
-
-    # Get training data in PyArrow format
-    train_iter = raw_dset["train"].data[0]
-    # Convert from arrow array to native Python list
-    train_iter = [s.as_py() for s in train_iter]
-
-    # Get torchtext tokenizer
+    raw_dset = load_dataset("ptb_text_only")
     tokenizer = get_tokenizer("basic_english")
 
-    vocab = build_vocab_from_iterator(
-        map(tokenizer, train_iter), specials=["<pad>", "<unk>", "<eos>"]
-    )
-    # Define unknown word as the default index to use
-    vocab.set_default_index(vocab["<unk>"])
-
-    def data_process(raw_text_iter):
-        """
-        Converts raw text into a flat Tensor of token indices and a parallel flat list of token strings.
-        """
-        token_lists = [tokenizer(item) + ["<eos>"] for item in raw_text_iter]
-        token_lists = [t for t in token_lists if len(t) > 1]
-        flat_strings = [tok for sent in token_lists for tok in sent]
-        flat_ids = torch.tensor(vocab(flat_strings), dtype=torch.long).to(device)
-        return flat_ids, flat_strings
-
-    # Convert from arrow arrays to native Python lists
     train_sents = [s.as_py() for s in raw_dset["train"].data[0]]
     val_sents = [s.as_py() for s in raw_dset["validation"].data[0]]
     test_sents = [s.as_py() for s in raw_dset["test"].data[0]]
 
-    # Flatten datasets into one long tokenised string each
+    vocab = build_vocab_from_iterator(
+        map(tokenizer, train_sents),
+        specials=["<pad>", "<unk>", "<eos>"],
+    )
+    vocab.set_default_index(vocab["<unk>"])
+
+    def data_process(raw_text_iter) -> tuple[torch.Tensor, list[str]]:
+        token_lists = [tokenizer(item) + ["<eos>"] for item in raw_text_iter]
+        token_lists = [tokens for tokens in token_lists if len(tokens) > 1]
+        flat_tokens = [token for tokens in token_lists for token in tokens]
+        flat_ids = torch.tensor(vocab(flat_tokens), dtype=torch.long).to(device)
+        return flat_ids, flat_tokens
+
     train_flat, train_flat_text = data_process(train_sents)
     val_flat, _ = data_process(val_sents)
     test_flat, _ = data_process(test_sents)
 
-    # Get padding token
-    PAD_TOKEN = vocab["<pad>"]
-
-    # Prepare data for a next-token prediction language modelling task
-    train_iter = batchify_s2s(train_flat, batch_size, window_size, PAD_TOKEN, device)
-    val_iter = batchify_s2s(val_flat, batch_size, window_size, PAD_TOKEN, device)
-    test_iter = batchify_s2s(test_flat, batch_size, window_size, PAD_TOKEN, device)
-
+    pad_token = vocab["<pad>"]
+    train_iter = batchify_s2s(train_flat, batch_size, window_size, pad_token, device)
+    val_iter = batchify_s2s(val_flat, batch_size, window_size, pad_token, device)
+    test_iter = batchify_s2s(test_flat, batch_size, window_size, pad_token, device)
     train_text_iter = batchify_s2s_text(train_flat_text, batch_size, window_size)
 
-    return vocab, (train_iter, val_iter, test_iter), train_text_iter, PAD_TOKEN
+    return vocab, (train_iter, val_iter, test_iter), train_text_iter, pad_token
+
 
 def create_model(
-    hyperparams: dict[str, Any], device: Device, vocabulary_size: int
+    hyperparams: dict[str, Any],
+    device: Device,
+    vocabulary_size: int,
 ) -> torch.nn.Module:
     """
-    Selects and creates model based on hyperparameters passed.
-
-    Args:
-      hyperparams: Model hyperparameters.
-      device: Device the model will be run on.
-      vocabulary_size: Size of the vocabulary.
-    Returns:
-      An instance of a torch model based on the hyperparameters passed.
+    Creates the Quixer model.
     """
-    model_str = hyperparams["model"]
-    model: torch.nn.Module
-    if model_str == "Quixer":
-        model = Quixer(
-            n_qubits=hyperparams["qubits"],
-            n_tokens=hyperparams["window"],
-            qsvt_polynomial_degree=hyperparams["layers"],
-            n_ansatz_layers=hyperparams["ansatz_layers"],
-            vocabulary_size=vocabulary_size,
-            embedding_dimension=hyperparams["dimension"],
-            dropout=hyperparams["dropout"],
-            batch_size=hyperparams["batch_size"],
-            device=device,
-        )
-    else:
-        raise ValueError(f"Unrecognized model: {model_str}")
+    return Quixer(
+        n_qubits=hyperparams["qubits"],
+        n_tokens=hyperparams["window"],
+        qsvt_polynomial_degree=hyperparams["layers"],
+        n_ansatz_layers=hyperparams["ansatz_layers"],
+        vocabulary_size=vocabulary_size,
+        embedding_dimension=hyperparams["dimension"],
+        dropout=hyperparams["dropout"],
+        batch_size=hyperparams["batch_size"],
+        device=device,
+    )
 
-    return model
+
+def load_teacher(
+    hyperparams: dict[str, Any],
+):
+    """
+    Loads and freezes the teacher model on CUDA.
+    """
+    teacher_name = hyperparams["teacher_model_name"]
+    teacher_device = torch.device(hyperparams.get("teacher_device", "cuda"))
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        teacher_name,
+        trust_remote_code=hyperparams.get("trust_remote_code", True),
+    )
+    tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        teacher_name,
+        torch_dtype="auto",
+        trust_remote_code=hyperparams.get("trust_remote_code", True),
+    ).to(teacher_device)
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    print(f"Teacher: {teacher_name} on {teacher_device}")
+    return tokenizer, model, teacher_device
+
+
+def clean_teacher_prompt(tokens: np.ndarray) -> str:
+    """
+    Converts a Quixer word-token context back to plain text.
+    """
+    specials = {"<pad>", "<unk>", "<eos>", ""}
+    text = " ".join(str(token) for token in tokens if token not in specials)
+    text = re.sub(r" ([.,!?;:)])", r"\1", text)
+    text = re.sub(r"([(]) ", r"\1", text)
+    text = re.sub(r" ' ", "'", text)
+    text = re.sub(r" 's\b", "'s", text)
+    return text.strip()
+
 
 def uld_distillation_loss(
     student_logits: torch.Tensor,
@@ -240,150 +224,164 @@ def uld_distillation_loss(
     hyperparams: dict[str, Any],
 ) -> torch.Tensor:
     """
-    Universal Logit Distillation loss between student and teacher logits.
+    Universal Logit Distillation loss.
+
+    This is the UDL core: softmax, sort probabilities descending, pad the
+    smaller vocabulary, then compute L1 distance averaged over batch positions.
     """
-    student_temp = hyperparams["student_temperature"]
-    teacher_temp = hyperparams["teacher_temperature"]
-    if student_temp <= 0 or teacher_temp <= 0:
-        raise ValueError("student_temperature and teacher_temperature must be > 0")
+    student_temperature = hyperparams.get("student_temperature", 1.0)
+    teacher_temperature = hyperparams.get("teacher_temperature", 1.0)
 
-    student_probs = F.softmax(student_logits.float() / student_temp, dim=-1)
-    teacher_probs = F.softmax(teacher_logits.float() / teacher_temp, dim=-1)
+    student_probs = F.softmax(student_logits.float() / student_temperature, dim=-1)
+    teacher_probs = F.softmax(teacher_logits.float() / teacher_temperature, dim=-1)
 
-    # GOLD-style ULD compares sorted probability ranks.
     student_sorted = student_probs.sort(dim=-1, descending=True).values
     teacher_sorted = teacher_probs.sort(dim=-1, descending=True).values
 
-    # Match vocab dimensions by zero-padding the smaller side.
-    student_vocab_size = student_sorted.size(-1)
-    teacher_vocab_size = teacher_sorted.size(-1)
-    max_vocab_size = max(student_vocab_size, teacher_vocab_size)
+    max_vocab_size = max(student_sorted.size(-1), teacher_sorted.size(-1))
+    student_sorted = F.pad(
+        student_sorted,
+        (0, max_vocab_size - student_sorted.size(-1)),
+        value=0.0,
+    )
+    teacher_sorted = F.pad(
+        teacher_sorted,
+        (0, max_vocab_size - teacher_sorted.size(-1)),
+        value=0.0,
+    )
 
-    if student_vocab_size < max_vocab_size:
-        student_sorted = F.pad(student_sorted, (0, max_vocab_size - student_vocab_size))
-    if teacher_vocab_size < max_vocab_size:
-        teacher_sorted = F.pad(teacher_sorted, (0, max_vocab_size - teacher_vocab_size))
+    return (student_sorted - teacher_sorted).abs().sum(dim=-1).mean()
 
-    # Normalize by number of positions (batch or batch*time), not by vocab size.
-    num_positions = max(1, student_sorted.numel() // student_sorted.size(-1))
-    return F.l1_loss(student_sorted, teacher_sorted, reduction="sum") / num_positions
 
-def uld_combined_loss(
+def combined_distillation_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     labels: torch.Tensor,
     hyperparams: dict[str, Any],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    distillation_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Combined cross-entropy + ULD distillation loss for next-token prediction.
+    Computes CE + weighted UDL for Quixer next-token prediction.
     """
+    ce_weight = hyperparams.get(
+        "crossentropy_weight",
+        hyperparams.get("ce_weight", 1.0),
+    )
     ce_loss = F.cross_entropy(student_logits, labels)
     dist_loss = uld_distillation_loss(student_logits, teacher_logits, hyperparams)
-    total = hyperparams["crossentropy_weight"] * ce_loss + hyperparams["distillation_weight"] * dist_loss
-    return total, ce_loss, dist_loss
+    total_loss = ce_weight * ce_loss + distillation_weight * dist_loss
+    return total_loss, ce_loss, dist_loss
+
+
+def precompute_teacher_logits(
+    iterator: torch.Tensor,
+    text_iter: np.ndarray,
+    window_size: int,
+    teacher_tokenizer,
+    teacher_model: torch.nn.Module,
+    teacher_device: Device,
+    hyperparams: dict[str, Any],
+) -> torch.Tensor:
+    """
+    Precomputes teacher next-token logits for every training batch.
+    """
+    n_batches = iterator.shape[0] - window_size
+    batch_size = iterator.shape[1]
+    teacher_batch_size = hyperparams.get("teacher_inference_batch_size", batch_size)
+    max_length = hyperparams.get(
+        "teacher_max_length",
+        hyperparams.get("max_length", window_size),
+    )
+    teacher_vocab_size = teacher_model.config.vocab_size
+    cached_logits = torch.empty(
+        (n_batches, batch_size, teacher_vocab_size),
+        dtype=next(teacher_model.parameters()).dtype,
+        device="cpu",
+    )
+
+    print("Precomputing teacher logits...")
+
+    with torch.inference_mode():
+        for batch_idx in tqdm(range(n_batches)):
+            x_text, _ = get_batch_s2s(text_iter, batch_idx, window_size)
+            prompts = [clean_teacher_prompt(row) for row in x_text]
+            prompts = [prompt or teacher_tokenizer.eos_token for prompt in prompts]
+
+            batch_logits = []
+            for start in range(0, len(prompts), teacher_batch_size):
+                sub_prompts = prompts[start : start + teacher_batch_size]
+                encoded = teacher_tokenizer(
+                    sub_prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                ).to(teacher_device)
+
+                output = teacher_model(**encoded)
+                last_positions = encoded["attention_mask"].sum(dim=1) - 1
+                rows = torch.arange(output.logits.size(0), device=teacher_device)
+                next_logits = output.logits[rows, last_positions, :]
+                batch_logits.append(next_logits.cpu())
+
+            cached_logits[batch_idx] = torch.cat(batch_logits, dim=0)
+
+    return cached_logits
+
 
 def train_epoch(
     model: torch.nn.Module,
     iterator: torch.Tensor,
     optimizer: torch.optim.Optimizer,
     clip: float,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     window_size: int,
     cached_teacher_logits: torch.Tensor,
     hyperparams: dict[str, Any],
     current_distillation_weight: float,
-):
+) -> tuple[float, float, float]:
     """
-    Runs training loop for one epoch.
+    Runs one training epoch.
     """
     model.train()
-
-    epoch_loss = 0
-    epoch_ce_loss = 0
-    epoch_dist_loss = 0
+    epoch_loss = 0.0
+    epoch_ce_loss = 0.0
+    epoch_dist_loss = 0.0
 
     n_batches = iterator.shape[0] - window_size
-
     idxs = list(range(n_batches))
     random.shuffle(idxs)
     model_device = next(model.parameters()).device
 
     for batch_idx in tqdm(idxs, total=n_batches):
         x, y = get_batch_s2s(iterator, batch_idx, window_size)
-        teacher_next_token_logits = cached_teacher_logits[batch_idx].to(model_device)
-
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         student_logits, _ = model(x)
-
-        total_loss, ce_loss, dist_loss = uld_combined_loss(
-            student_logits, teacher_next_token_logits, y, hyperparams
+        teacher_logits = cached_teacher_logits[batch_idx].to(model_device).float()
+        total_loss, ce_loss, dist_loss = combined_distillation_loss(
+            student_logits,
+            teacher_logits,
+            y,
+            hyperparams,
+            current_distillation_weight,
         )
-        # Allow epoch-wise annealing of distillation pressure.
-        total_loss = total_loss + (current_distillation_weight - hyperparams["distillation_weight"]) * dist_loss
-        # print(f"Batch {batch_idx}: Total Loss={total_loss.item():.4f}, CE Loss={ce_loss.item():.4f}, Distillation Loss={dist_loss.item():.4f}")
-        total_loss.backward()
 
-        if clip:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
 
         optimizer.step()
+        scheduler.step()
 
         epoch_loss += total_loss.item()
         epoch_ce_loss += ce_loss.item()
         epoch_dist_loss += dist_loss.item()
 
-    return epoch_loss / n_batches, epoch_ce_loss / n_batches, epoch_dist_loss / n_batches
-
-def precompute_teacher_logits(
-    iterator: torch.Tensor,
-    text_iter: np.ndarray,
-    window_size: int,
-    teacher_tokenizer: AutoTokenizer,
-    teacher_model: AutoModelForCausalLM,
-    device: Device,
-    hyperparams: dict[str, Any],
-) -> torch.Tensor:
-    """
-    Pre-computes teacher next-token logits for all batches and caches them on CPU.
-    Returns a tensor of shape [n_batches, batch_size, teacher_vocab_size].
-    """
-    n_batches = iterator.shape[0] - window_size
-    specials = {"<pad>", "<unk>", "<eos>", ""}
-
-    def _clean(tokens):
-        text = " ".join(t for t in tokens if t not in specials)
-        text = re.sub(r" ([.,!?;:)])", r"\1", text)
-        text = re.sub(r"([(]) ", r"\1", text)
-        text = re.sub(r" ' ", "'", text)
-        text = re.sub(r" 's\b", "'s", text)
-        return text
-
-    teacher_inference_batch_size = hyperparams.get("teacher_inference_batch_size", 16)
-    all_logits = []
-    print("Pre-computing teacher logits...")
-
-    with torch.no_grad():
-        for batch_idx in tqdm(range(n_batches)):
-            x_text, _ = get_batch_s2s(text_iter, batch_idx, window_size)
-            x_text_cleaned = [_clean(row) for row in x_text]
-
-            # Process in smaller sub-batches to avoid OOM
-            sub_logits = []
-            for i in range(0, len(x_text_cleaned), teacher_inference_batch_size):
-                sub = x_text_cleaned[i : i + teacher_inference_batch_size]
-                enc = teacher_tokenizer(
-                    sub,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=hyperparams["max_length"],
-                ).to(device)
-                teacher_out = teacher_model(**enc)
-                sub_logits.append(teacher_out.logits[:, -1, :].cpu())
-
-            all_logits.append(torch.cat(sub_logits, dim=0))
-
-    return torch.stack(all_logits)  # [n_batches, batch_size, teacher_vocab_size]
+    return (
+        epoch_loss / n_batches,
+        epoch_ce_loss / n_batches,
+        epoch_dist_loss / n_batches,
+    )
 
 
 def evaluate(
@@ -393,16 +391,13 @@ def evaluate(
     window_size: int,
 ) -> float:
     """
-    Evaluates model on the supplied data.
+    Evaluates with CE only. PPL must always be computed from CE.
     """
-
     model.eval()
-
-    epoch_loss = 0
-
+    epoch_loss = 0.0
     n_batches = data.shape[0] - window_size
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx in tqdm(range(n_batches)):
             x, y = get_batch_s2s(data, batch_idx, window_size)
             yhat, _ = model(x)
@@ -419,20 +414,13 @@ def train_cycle(
     val_iter: torch.Tensor,
     test_iter: torch.Tensor,
     train_text_iter: np.ndarray,
-    teacher_tokenizer: AutoTokenizer,
-    teacher_model: AutoModelForCausalLM,
+    teacher_tokenizer,
+    teacher_model: torch.nn.Module,
+    teacher_device: Device,
 ) -> float:
     """
-    Run a training cycle.
-
-    Args:
-      model: The model to train.
-      hyperparams: The model hyperparameters.
-      train_iter: Tensor containing training data returned by `setup_dataset` function.
-      val_iter: Tensor containing validation data returned by `setup_dataset` function.
-      test_iter: Tensor containing test data returned by `setup_dataset` function.
+    Runs the full train/validate/test cycle.
     """
-
     folder_path = Path("./trained_models")
     folder_path.mkdir(exist_ok=True, parents=True)
     checkpoint_fpath = (
@@ -440,7 +428,6 @@ def train_cycle(
         / f"q_transformer_lm_{hyperparams['model']}_{hyperparams['seed']}_{int(time.time())}.pt"
     )
 
-    # Set up optimizer
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=hyperparams["lr"],
@@ -448,52 +435,42 @@ def train_cycle(
         eps=hyperparams["eps"],
     )
 
-    # Set up learning rate scheduler
-    scheduler = None
-    if hyperparams["lr_sched"] == "cos":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=hyperparams["epochs"],
-            eta_min=hyperparams.get("min_lr", 0.0),
-        )
-    elif hyperparams["lr_sched"] == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=hyperparams.get("plateau_factor", 0.5),
-            patience=hyperparams.get("plateau_patience", 2),
-            min_lr=hyperparams.get("min_lr", 1e-5),
-        )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=hyperparams["restart_epochs"],
+    )
 
     loss_function = torch.nn.CrossEntropyLoss()
 
     cached_teacher_logits = precompute_teacher_logits(
-        train_iter, train_text_iter, hyperparams["window"],
-        teacher_tokenizer, teacher_model, next(teacher_model.parameters()).device,
+        train_iter,
+        train_text_iter,
+        hyperparams["window"],
+        teacher_tokenizer,
+        teacher_model,
+        teacher_device,
         hyperparams,
     )
-
-    # Teacher is no longer needed — offload to CPU to free VRAM for student training
     teacher_model.cpu()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
     def _evaluate(data: torch.Tensor):
         return evaluate(model, data, loss_function, hyperparams["window"])
 
-    best_valid_loss = float("inf")
-    initial_distillation_weight = hyperparams["distillation_weight"]
+    initial_distillation_weight = hyperparams.get(
+        "distillation_weight",
+        hyperparams.get("kd_weight", 1.0),
+    )
     final_distillation_weight = hyperparams.get(
-        "distillation_weight_final", initial_distillation_weight
+        "distillation_weight_final",
+        initial_distillation_weight,
     )
 
+    best_valid_loss = float("inf")
     for epoch in range(hyperparams["epochs"]):
         start_time = time.time()
 
-        if hyperparams["epochs"] > 1:
-            anneal_fraction = epoch / (hyperparams["epochs"] - 1)
-        else:
-            anneal_fraction = 1.0
+        anneal_fraction = epoch / max(1, hyperparams["epochs"] - 1)
         current_distillation_weight = (
             initial_distillation_weight
             + anneal_fraction * (final_distillation_weight - initial_distillation_weight)
@@ -504,6 +481,7 @@ def train_cycle(
             train_iter,
             optimizer,
             hyperparams["max_grad_norm"],
+            scheduler,
             hyperparams["window"],
             cached_teacher_logits,
             hyperparams,
@@ -511,101 +489,81 @@ def train_cycle(
         )
 
         valid_loss = _evaluate(val_iter)
-
-        if scheduler:
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(valid_loss)
-            else:
-                scheduler.step()
-
-        end_time = time.time()
-
-        epoch_mins, epoch_secs = epoch_time(start_time, end_time)
+        epoch_mins, epoch_secs = epoch_time(start_time, time.time())
 
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss
             torch.save(model.state_dict(), checkpoint_fpath)
 
-        current_lr = optimizer.param_groups[0]["lr"]
         print(f"Epoch: {epoch + 1:02} | Time: {epoch_mins}m {epoch_secs}s")
-        print(f"\tTrain Loss: {train_loss:.3f} | Train ppl: {math.exp(train_loss)}")
-        print(f"\tTrain CE: {train_ce_loss:.3f} | Train Dist: {train_dist_loss:.6f}")
-        print(f"\tLR: {current_lr:.6f} | DistW: {current_distillation_weight:.3f}")
-        print(f"\t Val. Loss: {valid_loss:.3f} |  Val. ppl: {math.exp(valid_loss)}")
+        print(f"\tTrain Loss: {train_loss:.3f}")
+        print(f"\tTrain CE: {train_ce_loss:.3f} | Train ppl: {math.exp(train_ce_loss):.3f}")
+        print(
+            f"\tTrain UDL: {train_dist_loss:.6f} | "
+            f"DistW: {current_distillation_weight:.3f}"
+        )
+        print(f"\t Val. Loss: {valid_loss:.3f} |  Val. ppl: {math.exp(valid_loss):.3f}")
 
-    model.load_state_dict(torch.load(checkpoint_fpath, weights_only=True))
+    model.load_state_dict(
+        torch.load(checkpoint_fpath, map_location=next(model.parameters()).device)
+    )
 
     valid_loss = _evaluate(val_iter)
     test_loss = _evaluate(test_iter)
 
     print("FINAL TRAINED MODEL STATS:")
-    print(f"\t Val. Loss: {valid_loss:.3f} |  Val. ppl: {math.exp(valid_loss)}")
-    print(f"\t Test Loss: {test_loss:.3f} |  Test ppl: {math.exp(test_loss)}")
+    print(f"\t Val. Loss: {valid_loss:.3f} |  Val. ppl: {math.exp(valid_loss):.3f}")
+    print(f"\t Test Loss: {test_loss:.3f} |  Test ppl: {math.exp(test_loss):.3f}")
 
     return test_loss
 
 
 def seed(SEED: int) -> None:
     """
-    Sets the seed for Python's random module, numpy's RNG and torch's RNG.
-
-    Args:
-      SEED: integer specifying the seed
+    Sets Python, NumPy and PyTorch seeds.
     """
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
 
 
-def get_train_evaluate(device: Device, teacher_model_id: str) -> Callable:
+def get_train_evaluate(device: Device) -> Callable:
     """
-    Returns a function that runs the training cycle on a specified torch device.
-
-    Args:
-      device: Torch device
-
-    Returns:
-      Callable taking in a set of parameters as a dict and returning the value of the validation loss
-      at the end of the training cycle.
+    Returns a callable that trains and evaluates Quixer.
     """
-
-    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_id)
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        teacher_model_id,
-        torch_dtype="auto",
-    ).to(device)
-    teacher_model.eval()
-
     def train_evaluate(parameterization: dict[str, Any]) -> float:
-        """
-        Train the model and return the test loss.
-        """
-
-        if "seed" not in parameterization:
-            parameterization["seed"] = int.from_bytes(os.urandom(4), "big")
+        parameterization.setdefault("seed", int.from_bytes(os.urandom(4), "big"))
+        parameterization.setdefault("model", "Quixer")
 
         seed(parameterization["seed"])
 
         vocab, (train_iter, val_iter, test_iter), train_text_iter, _ = setup_dataset(
-            device, parameterization["batch_size"], parameterization["window"]
+            device,
+            parameterization["batch_size"],
+            parameterization["window"],
         )
 
         model = create_model(parameterization, device, len(vocab))
-
         initialise_weights(model)
-
         model = model.to(device)
 
-        # train_cycle may offload teacher to CPU to free VRAM; move it back per run.
-        teacher_model.to(device)
+        teacher_tokenizer, teacher_model, teacher_device = load_teacher(parameterization)
+        teacher_model.to(teacher_device)
         teacher_model.eval()
 
-        valid_loss = train_cycle(
-            model, parameterization, train_iter, val_iter, test_iter, train_text_iter, teacher_tokenizer, teacher_model
+        test_loss = train_cycle(
+            model,
+            parameterization,
+            train_iter,
+            val_iter,
+            test_iter,
+            train_text_iter,
+            teacher_tokenizer,
+            teacher_model,
+            teacher_device,
         )
 
-        return valid_loss
+        return test_loss
 
     return train_evaluate
