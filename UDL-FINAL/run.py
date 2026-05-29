@@ -29,6 +29,9 @@ quixer_hparams = {
     "student_temperature": 1.0,
     "ce_weight": 1.0,
     "uld_weight": 0.3,
+    "uld_top_k": 128,
+    "teacher_max_length": 256,
+    "teacher_cache_dir": "teacher_cache",
 }
 
 parser = argparse.ArgumentParser(
@@ -45,6 +48,9 @@ parser.add_argument("--teacher-temperature", type=float, default=1.0)
 parser.add_argument("--student-temperature", type=float, default=1.0)
 parser.add_argument("--ce-weight", type=float, default=1.0)
 parser.add_argument("--uld-weight", type=float, default=0.3)
+parser.add_argument("--uld-top-k", type=int, default=128)
+parser.add_argument("--teacher-max-length", type=int, default=256)
+parser.add_argument("--teacher-cache-dir", default="teacher_cache")
 
 args = parser.parse_args()
 
@@ -64,6 +70,9 @@ hyperparameters["teacher_temperature"] = args.teacher_temperature
 hyperparameters["student_temperature"] = args.student_temperature
 hyperparameters["ce_weight"] = args.ce_weight
 hyperparameters["uld_weight"] = args.uld_weight
+hyperparameters["uld_top_k"] = args.uld_top_k
+hyperparameters["teacher_max_length"] = args.teacher_max_length
+hyperparameters["teacher_cache_dir"] = args.teacher_cache_dir
 
 print(
     f"Running Quixer | dim={hyperparameters['dimension']} | seed={hyperparameters['seed']}"

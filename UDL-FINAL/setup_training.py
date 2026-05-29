@@ -4,6 +4,7 @@ import random
 import re
 import time
 import warnings
+import gc
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
@@ -225,23 +226,77 @@ def teacher_next_logits(
 
 def uld_loss(
     student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
+    teacher_probs: torch.Tensor,
     student_temperature: float,
-    teacher_temperature: float,
 ) -> torch.Tensor:
     student_probs = F.softmax(student_logits.float() / student_temperature, dim=-1)
-    teacher_probs = F.softmax(teacher_logits.float() / teacher_temperature, dim=-1)
+    k = teacher_probs.size(-1)
+    student_k = min(k, student_probs.size(-1))
+    student_probs = torch.topk(student_probs, k=student_k, dim=-1).values
 
-    student_probs = student_probs.sort(dim=-1, descending=True).values
-    teacher_probs = teacher_probs.sort(dim=-1, descending=True).values
-
-    diff_size = student_probs.size(-1) - teacher_probs.size(-1)
-    if diff_size > 0:
-        teacher_probs = F.pad(teacher_probs, (0, diff_size), value=0.0)
-    elif diff_size < 0:
-        student_probs = F.pad(student_probs, (0, -diff_size), value=0.0)
+    if student_k < k:
+        student_probs = F.pad(student_probs, (0, k - student_k), value=0.0)
 
     return torch.abs(student_probs - teacher_probs).sum(dim=-1).mean()
+
+
+def _safe_cache_name(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", text).strip("_")
+
+
+def cache_teacher_probs(
+    iterator: torch.Tensor,
+    vocab: torchtext.vocab.Vocab,
+    hyperparams: dict[str, Any],
+) -> torch.Tensor:
+    teacher_name = hyperparams["teacher_model_name"]
+    window_size = hyperparams["window"]
+    top_k = int(hyperparams.get("uld_top_k", 128))
+    max_length = int(hyperparams.get("teacher_max_length", 256))
+    teacher_temperature = float(hyperparams.get("teacher_temperature", 1.0))
+
+    cache_dir = Path(hyperparams.get("teacher_cache_dir", "teacher_cache"))
+    cache_dir.mkdir(exist_ok=True, parents=True)
+    cache_path = cache_dir / (
+        f"{_safe_cache_name(teacher_name)}"
+        f"_w{window_size}_b{hyperparams['batch_size']}"
+        f"_k{top_k}_t{teacher_temperature}_m{max_length}.pt"
+    )
+
+    if cache_path.exists():
+        print(f"Loading teacher cache: {cache_path}")
+        return torch.load(cache_path, map_location="cpu")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Teacher cache precompute requires CUDA.")
+
+    teacher_tokenizer, teacher_model = load_teacher(teacher_name)
+    n_batches = iterator.shape[0] - window_size
+    cached_batches = []
+
+    print(f"Caching teacher top-{top_k} probabilities: {cache_path}")
+    for batch_idx in tqdm(range(n_batches), desc="Teacher cache"):
+        x, _ = get_batch_s2s(iterator, batch_idx, window_size)
+        contexts = decode_contexts(x, vocab)
+        logits = teacher_next_logits(
+            teacher_model=teacher_model,
+            teacher_tokenizer=teacher_tokenizer,
+            contexts=contexts,
+            max_length=max_length,
+        )
+        probs = F.softmax(logits / teacher_temperature, dim=-1)
+        k = min(top_k, probs.size(-1))
+        cached_batches.append(torch.topk(probs, k=k, dim=-1).values.cpu().half())
+
+    teacher_probs = torch.stack(cached_batches)
+    torch.save(teacher_probs, cache_path)
+
+    del teacher_model
+    del teacher_tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return teacher_probs
 
 
 def train_epoch(
@@ -252,18 +307,12 @@ def train_epoch(
     clip: float,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
     window_size: int,
-    vocab: torchtext.vocab.Vocab,
-    teacher_tokenizer=None,
-    teacher_model: Optional[torch.nn.Module] = None,
-    teacher_max_length: int = 256,
+    teacher_probs_cache: Optional[torch.Tensor] = None,
     ce_weight: float = 1.0,
     uld_weight: float = 0.0,
     student_temperature: float = 1.0,
-    teacher_temperature: float = 1.0,
 ) -> tuple[float, float, float]:
     model.train()
-    if teacher_model is not None:
-        teacher_model.eval()
 
     epoch_loss = 0.0
     epoch_ce_loss = 0.0
@@ -281,20 +330,15 @@ def train_epoch(
         ce_loss = loss_function(student_logits, y)
 
         distill_loss = torch.zeros((), device=student_logits.device)
-        if teacher_model is not None and teacher_tokenizer is not None and uld_weight > 0:
-            contexts = decode_contexts(x, vocab)
-            t_logits = teacher_next_logits(
-                teacher_model=teacher_model,
-                teacher_tokenizer=teacher_tokenizer,
-                contexts=contexts,
-                max_length=teacher_max_length,
-            ).to(student_logits.device)
-
+        if teacher_probs_cache is not None and uld_weight > 0:
+            teacher_probs = teacher_probs_cache[batch_idx].to(
+                device=student_logits.device,
+                dtype=torch.float32,
+            )
             distill_loss = uld_loss(
                 student_logits=student_logits,
-                teacher_logits=t_logits,
+                teacher_probs=teacher_probs,
                 student_temperature=student_temperature,
-                teacher_temperature=teacher_temperature,
             )
 
         loss = ce_weight * ce_loss + uld_weight * distill_loss
@@ -346,6 +390,7 @@ def train_cycle(
     test_iter: torch.Tensor,
     vocab: torchtext.vocab.Vocab,
     device: Device,
+    teacher_probs_cache: Optional[torch.Tensor] = None,
 ) -> float:
     folder_path = Path("./trained_models")
     folder_path.mkdir(exist_ok=True, parents=True)
@@ -370,17 +415,9 @@ def train_cycle(
 
     loss_function = torch.nn.CrossEntropyLoss()
 
-    teacher_tokenizer = None
-    teacher_model = None
-
-    if hyperparams.get("use_uld", False):
-        if not torch.cuda.is_available():
-            raise RuntimeError("ULD teacher is configured to run on CUDA, but CUDA is not available.")
-        teacher_tokenizer, teacher_model = load_teacher(
-            teacher_model_name=hyperparams["teacher_model_name"],
-        )
+    if teacher_probs_cache is not None:
         print(f"Teacher: {hyperparams['teacher_model_name']}")
-        print(f"Student vocab: {len(vocab)} | Teacher vocab: {teacher_tokenizer.vocab_size}")
+        print(f"Student vocab: {len(vocab)} | cached teacher top-k: {teacher_probs_cache.size(-1)}")
 
     def _evaluate(iter: torch.Tensor):
         return evaluate(model, iter, loss_function, hyperparams["window"])
@@ -397,14 +434,10 @@ def train_cycle(
             clip=hyperparams["max_grad_norm"],
             scheduler=scheduler,
             window_size=hyperparams["window"],
-            vocab=vocab,
-            teacher_tokenizer=teacher_tokenizer,
-            teacher_model=teacher_model,
-            teacher_max_length=hyperparams.get("teacher_max_length", 256),
+            teacher_probs_cache=teacher_probs_cache,
             ce_weight=hyperparams.get("ce_weight", 1.0),
             uld_weight=hyperparams.get("uld_weight", 0.0),
             student_temperature=hyperparams.get("student_temperature", 1.0),
-            teacher_temperature=hyperparams.get("teacher_temperature", 1.0),
         )
 
         valid_loss = _evaluate(val_iter)
@@ -417,7 +450,7 @@ def train_cycle(
         print(f"Epoch: {epoch + 1:02} | Time: {epoch_mins}m {epoch_secs}s")
         print(f"\tTrain Loss: {train_loss:.3f}")
         print(f"\tTrain CE: {train_ce_loss:.3f} | Train CE ppl: {math.exp(train_ce_loss):.3f}")
-        if teacher_model is not None:
+        if teacher_probs_cache is not None:
             print(f"\tTrain ULD: {train_uld_loss:.3f}")
         print(f"\t Val. Loss: {valid_loss:.3f} |  Val. ppl: {math.exp(valid_loss):.3f}")
 
@@ -454,6 +487,14 @@ def get_train_evaluate(device: Device) -> Callable:
             window_size=parameterization["window"],
         )
 
+        teacher_probs_cache = None
+        if parameterization.get("use_uld", False):
+            teacher_probs_cache = cache_teacher_probs(
+                iterator=train_iter,
+                vocab=vocab,
+                hyperparams=parameterization,
+            )
+
         model = create_model(parameterization, device, len(vocab))
         initialise_weights(model)
         model = model.to(device)
@@ -466,6 +507,7 @@ def get_train_evaluate(device: Device) -> Callable:
             test_iter=test_iter,
             vocab=vocab,
             device=device,
+            teacher_probs_cache=teacher_probs_cache,
         )
 
     return train_evaluate
