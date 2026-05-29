@@ -31,6 +31,7 @@ quixer_hparams = {
     "uld_weight": 0.3,
     "uld_top_k": 128,
     "teacher_max_length": 256,
+    "teacher_batch_size": 1,
     "teacher_cache_dir": "teacher_cache",
 }
 
@@ -50,6 +51,7 @@ parser.add_argument("--ce-weight", type=float, default=1.0)
 parser.add_argument("--uld-weight", type=float, default=0.3)
 parser.add_argument("--uld-top-k", type=int, default=128)
 parser.add_argument("--teacher-max-length", type=int, default=256)
+parser.add_argument("--teacher-batch-size", type=int, default=1)
 parser.add_argument("--teacher-cache-dir", default="teacher_cache")
 
 args = parser.parse_args()
@@ -72,6 +74,7 @@ hyperparameters["ce_weight"] = args.ce_weight
 hyperparameters["uld_weight"] = args.uld_weight
 hyperparameters["uld_top_k"] = args.uld_top_k
 hyperparameters["teacher_max_length"] = args.teacher_max_length
+hyperparameters["teacher_batch_size"] = args.teacher_batch_size
 hyperparameters["teacher_cache_dir"] = args.teacher_cache_dir
 
 print(

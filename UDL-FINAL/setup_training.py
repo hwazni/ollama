@@ -254,6 +254,7 @@ def cache_teacher_probs(
     top_k = int(hyperparams.get("uld_top_k", 128))
     max_length = int(hyperparams.get("teacher_max_length", 256))
     teacher_temperature = float(hyperparams.get("teacher_temperature", 1.0))
+    teacher_batch_size = int(hyperparams.get("teacher_batch_size", 1))
 
     cache_dir = Path(hyperparams.get("teacher_cache_dir", "teacher_cache"))
     cache_dir.mkdir(exist_ok=True, parents=True)
@@ -278,15 +279,24 @@ def cache_teacher_probs(
     for batch_idx in tqdm(range(n_batches), desc="Teacher cache"):
         x, _ = get_batch_s2s(iterator, batch_idx, window_size)
         contexts = decode_contexts(x, vocab)
-        logits = teacher_next_logits(
-            teacher_model=teacher_model,
-            teacher_tokenizer=teacher_tokenizer,
-            contexts=contexts,
-            max_length=max_length,
-        )
-        probs = F.softmax(logits / teacher_temperature, dim=-1)
-        k = min(top_k, probs.size(-1))
-        cached_batches.append(torch.topk(probs, k=k, dim=-1).values.cpu().half())
+
+        batch_probs = []
+        for start in range(0, len(contexts), teacher_batch_size):
+            chunk_contexts = contexts[start : start + teacher_batch_size]
+            logits = teacher_next_logits(
+                teacher_model=teacher_model,
+                teacher_tokenizer=teacher_tokenizer,
+                contexts=chunk_contexts,
+                max_length=max_length,
+            )
+            probs = F.softmax(logits / teacher_temperature, dim=-1)
+            k = min(top_k, probs.size(-1))
+            batch_probs.append(torch.topk(probs, k=k, dim=-1).values.cpu().half())
+            del logits
+            del probs
+            torch.cuda.empty_cache()
+
+        cached_batches.append(torch.cat(batch_probs, dim=0))
 
     teacher_probs = torch.stack(cached_batches)
     torch.save(teacher_probs, cache_path)
